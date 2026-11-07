@@ -390,3 +390,133 @@ Deno.test("goupgrade - bump writes failure record then throws on go get failure"
     reads.restore();
   }
 });
+
+function fakeDockerfile(tag: string): string {
+  return `FROM golang:${tag} AS tools
+
+FROM golang:${tag} AS builder
+`;
+}
+
+function stubWriteTextFile() {
+  const writes: Record<string, string> = {};
+  const originalWriteTextFile = Deno.writeTextFile;
+  (Deno as unknown as Record<string, unknown>).writeTextFile = (
+    path: string,
+    content: string,
+  ) => {
+    writes[path] = content;
+    return Promise.resolve();
+  };
+  return {
+    writes,
+    restore: () => {
+      (Deno as unknown as Record<string, unknown>).writeTextFile =
+        originalWriteTextFile;
+    },
+  };
+}
+
+function stubProjectFiles(goMod: string, dockerfile: string) {
+  return stubReadTextFile((path) => {
+    if (path.endsWith("go.mod")) return goMod;
+    if (path.endsWith("Dockerfile")) return dockerfile;
+    throw new Error(`unexpected read: ${path}`);
+  });
+}
+
+Deno.test("goupgrade - sync-dockerfile rewrites golang base image tags to the go.mod minor version", async () => {
+  const reads = stubProjectFiles(
+    fakeGoMod("1.27.3"),
+    fakeDockerfile("1.26-alpine"),
+  );
+  const files = stubWriteTextFile();
+  const { writeResource, context } = makeContext();
+
+  try {
+    const result = await model.methods["sync-dockerfile"].execute({}, context);
+
+    assertEquals(
+      files.writes["/tmp/project/Dockerfile"],
+      fakeDockerfile("1.27-alpine"),
+    );
+    assertEquals(writeResource.writes.length, 1);
+    assertEquals(writeResource.writes[0].specName, "dockerfile-sync");
+    assertEquals(writeResource.writes[0].name, "current");
+    assertEquals(writeResource.writes[0].data, {
+      goVersion: "1.27.3",
+      syncedTo: "1.27",
+      previousVersions: ["1.26"],
+      changed: true,
+      success: true,
+    });
+    assertEquals(result.dataHandles!.length, 1);
+  } finally {
+    reads.restore();
+    files.restore();
+  }
+});
+
+Deno.test("goupgrade - sync-dockerfile collapses patch-pinned tags to the minor tag", async () => {
+  const dockerfile = "FROM golang:1.26.10-alpine AS builder\n";
+  const reads = stubProjectFiles(fakeGoMod("1.27.3"), dockerfile);
+  const files = stubWriteTextFile();
+  const { writeResource, context } = makeContext();
+
+  try {
+    await model.methods["sync-dockerfile"].execute({}, context);
+
+    assertEquals(
+      files.writes["/tmp/project/Dockerfile"],
+      "FROM golang:1.27-alpine AS builder\n",
+    );
+    assertEquals(writeResource.writes[0].data.previousVersions, ["1.26.10"]);
+    assertEquals(writeResource.writes[0].data.changed, true);
+  } finally {
+    reads.restore();
+    files.restore();
+  }
+});
+
+Deno.test("goupgrade - sync-dockerfile does not write when the Dockerfile is already in sync", async () => {
+  const reads = stubProjectFiles(
+    fakeGoMod("1.27.3"),
+    fakeDockerfile("1.27-alpine"),
+  );
+  const files = stubWriteTextFile();
+  const { writeResource, context } = makeContext();
+
+  try {
+    await model.methods["sync-dockerfile"].execute({}, context);
+
+    assertEquals(files.writes["/tmp/project/Dockerfile"], undefined);
+    assertEquals(writeResource.writes[0].data.changed, false);
+    assertEquals(writeResource.writes[0].data.success, true);
+  } finally {
+    reads.restore();
+    files.restore();
+  }
+});
+
+Deno.test("goupgrade - sync-dockerfile writes failure record then throws when no golang base image is present", async () => {
+  const reads = stubProjectFiles(fakeGoMod("1.27.3"), "FROM alpine:3.21\n");
+  const files = stubWriteTextFile();
+  const { writeResource, context } = makeContext();
+
+  try {
+    await assertRejects(
+      () => model.methods["sync-dockerfile"].execute({}, context),
+      Error,
+      "no golang base image found in /tmp/project/Dockerfile",
+    );
+
+    assertEquals(writeResource.writes.length, 1);
+    assertEquals(writeResource.writes[0].specName, "dockerfile-sync");
+    assertEquals(writeResource.writes[0].data.success, false);
+    assertEquals(writeResource.writes[0].data.previousVersions, []);
+    assertEquals(files.writes["/tmp/project/Dockerfile"], undefined);
+  } finally {
+    reads.restore();
+    files.restore();
+  }
+});

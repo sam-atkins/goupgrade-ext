@@ -1,6 +1,7 @@
 /**
- * Upgrades Go projects: bumps the toolchain version in go.mod and updates
- * all module dependencies via go get -u all.
+ * Upgrades Go projects: bumps the toolchain version in go.mod, updates
+ * all module dependencies via go get -u all, and syncs the Dockerfile's
+ * golang base image tag with the go directive.
  *
  * @module
  */
@@ -82,15 +83,63 @@ const OutputSchema = z.object({
   success: z.boolean(),
 });
 
+const GOLANG_TAG_PATTERN = /golang:(\d+\.\d+(?:\.\d+)?)/g;
+
+/** Extract the version from the go directive in go.mod contents. */
+function goModGoVersion(goMod: string): string {
+  const match = goMod.match(/^go\s+(\d+\.\d+(?:\.\d+)?)/m);
+  if (!match) {
+    throw new Error("no go directive found in go.mod");
+  }
+  return match[1];
+}
+
+/** Strip a full Go version to its major.minor form, e.g. "1.27.3" -> "1.27". */
+function minorVersion(version: string): string {
+  const [major, minor] = version.split(".");
+  return `${major}.${minor}`;
+}
+
+type SyncResult = {
+  content: string;
+  previousVersions: string[];
+  changed: boolean;
+};
+
+/** Rewrite golang base image tags in a Dockerfile to the given minor version. */
+function syncGolangFromLines(dockerfile: string, minor: string): SyncResult {
+  const previousVersions = [
+    ...new Set(
+      [...dockerfile.matchAll(GOLANG_TAG_PATTERN)].map((m) => m[1]),
+    ),
+  ];
+  const content = dockerfile.replace(GOLANG_TAG_PATTERN, `golang:${minor}`);
+  return { content, previousVersions, changed: content !== dockerfile };
+}
+
+const SyncDockerfileOutputSchema = z.object({
+  goVersion: z.string(),
+  syncedTo: z.string(),
+  previousVersions: z.array(z.string()),
+  changed: z.boolean(),
+  success: z.boolean(),
+});
+
 /** Model definition for upgrading Go projects. */
 export const model = {
   type: "@dismal_swamper/goupgrade",
-  version: "2026.09.19.1",
+  version: "2026.11.07.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
       toVersion: "2026.09.19.1",
       description: "Version bump, no schema changes",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.11.07.1",
+      description:
+        "Add sync-dockerfile method and dockerfile-sync resource, no changes to existing resources",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -104,6 +153,13 @@ export const model = {
     update: {
       description: "Result of the go get -u all dependency update",
       schema: UpdateOutputSchema,
+      lifetime: "infinite",
+      garbageCollection: 10,
+    },
+    "dockerfile-sync": {
+      description:
+        "Result of syncing the Dockerfile golang base image with go.mod",
+      schema: SyncDockerfileOutputSchema,
       lifetime: "infinite",
       garbageCollection: 10,
     },
@@ -216,6 +272,62 @@ export const model = {
           );
         }
 
+        return { dataHandles: [handle] };
+      },
+    },
+    "sync-dockerfile": {
+      description:
+        "Sync the Dockerfile's golang base image tag with the go directive in go.mod",
+      arguments: z.object({}),
+      execute: async (
+        _args: Record<string, never>,
+        context: {
+          globalArgs: GlobalArgs;
+          writeResource: (
+            specName: string,
+            name: string,
+            data: Record<string, unknown>,
+          ) => Promise<{ name: string }>;
+        },
+      ) => {
+        const workdir = context.globalArgs.workingDirectory || Deno.cwd();
+        const goMod = await Deno.readTextFile(`${workdir}/go.mod`);
+        const goVersion = goModGoVersion(goMod);
+        const minor = minorVersion(goVersion);
+
+        const dockerfilePath = `${workdir}/Dockerfile`;
+        const dockerfile = await Deno.readTextFile(dockerfilePath);
+        const { content, previousVersions, changed } = syncGolangFromLines(
+          dockerfile,
+          minor,
+        );
+
+        if (previousVersions.length === 0) {
+          await context.writeResource("dockerfile-sync", "current", {
+            goVersion,
+            syncedTo: minor,
+            previousVersions,
+            changed: false,
+            success: false,
+          });
+          throw new Error(`no golang base image found in ${dockerfilePath}`);
+        }
+
+        if (changed) {
+          await Deno.writeTextFile(dockerfilePath, content);
+        }
+
+        const handle = await context.writeResource(
+          "dockerfile-sync",
+          "current",
+          {
+            goVersion,
+            syncedTo: minor,
+            previousVersions,
+            changed,
+            success: true,
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
