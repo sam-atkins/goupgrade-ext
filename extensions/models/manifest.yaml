@@ -1,9 +1,10 @@
 manifestVersion: 1
 
 name: "@dismal_swamper/goupgrade"
-version: "2026.09.19.1"
+version: "2026.11.07.1"
 description: "Upgrade Go projects: bump the Go toolchain version in go.mod and update all module dependencies"
 repository: "https://github.com/sam-atkins/goupgrade-ext"
+license: MIT
 
 models:
   - goupgrade.ts
